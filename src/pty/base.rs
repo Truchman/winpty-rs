@@ -873,9 +873,16 @@ impl PTYProcess {
 impl Drop for PTYProcess {
     fn drop(&mut self) {
         unsafe {
+            // A reader thread that never got a process (spawn failed, or the
+            // PTY is dropped before one was set) exits on `None` without
+            // setting `reader_ready` or clearing `reader_atomic`, and drops
+            // its receivers. A failed send means the thread is gone, so stop
+            // waiting on flags it will never update.
             while !self.reader_ready.load(Ordering::Acquire) {
                 // Unblock thread if it is waiting for a process handle.
-                if self.reader_process_out.send(None).is_ok() {}
+                if self.reader_process_out.send(None).is_err() {
+                    break;
+                }
             }
 
             while self.reader_atomic.load(Ordering::Acquire) {
@@ -883,12 +890,15 @@ impl Drop for PTYProcess {
                 let _ = CancelIoEx(Into::<HANDLE>::into(self.conout), None);
 
                 // Send instruction to thread to finish
-                if self.reader_alive.send(false).is_ok() {}
+                if self.reader_alive.send(false).is_err() {
+                    break;
+                }
             }
 
-            // Wait for the thread to be down
+            // Wait for the thread to be down; a panic in it must not panic
+            // (or abort, mid-unwind) the drop.
             if let Some(thread_handle) = self.reading_thread.take() {
-                thread_handle.join().unwrap();
+                let _ = thread_handle.join();
             }
 
             if !self.conin.is_invalid() {
